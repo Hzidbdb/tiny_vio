@@ -1,0 +1,179 @@
+tiny_window MaixCAM-Pro (RISC-V) 移植指南
+============================================
+
+=== 概述 ===
+
+tiny_window 是纯 C99 实现的滑动窗口紧耦合视觉-惯性优化器。
+在一个大小为 N=5 的关键帧滑动窗口内, 将 IMU 预积分约束和
+PnP 视觉约束放入 LM 问题联合求解, 输出优化后的位姿、速度和 IMU 偏置。
+
+依赖链: tiny_linalg → tiny_opt + tiny_imu → tiny_window
+
+=== 已验证的测试结果 (2026-07-27) ===
+
+                    | glibc (gcc)      | musl (x86)       | musl (RISC-V)
+  ------------------|------------------|------------------|------------------
+  tiny_linalg       | 65 passed, 0 fail| 65 passed, 0 fail| 待实机验证
+  tiny_opt          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_ekf          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_pnp          | 20 passed, 0 fail| 20 passed, 0 fail| 待实机验证
+  tiny_imu          | 55 passed, 0 fail| 待 musl 验证     | 待实机验证
+  tiny_window       | 6 passed, 0 fail | 待 musl 验证     | 待实机验证
+
+=== 依赖检查 ===
+
+移植前确保所有依赖模块已在 x86 上通过测试:
+  # 验证 tiny_linalg
+  gcc -std=c99 -O2 -o test_linalg tiny_linalg/test_linalg.c \
+    tiny_linalg/tiny_linalg.c -lm && ./test_linalg
+
+  # 验证 tiny_opt
+  gcc -std=c99 -O2 -o test_opt tiny_opt/test_opt.c \
+    tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm && ./test_opt
+
+  # 验证 tiny_imu
+  gcc -std=c99 -O2 -o test_imu tiny_imu/test_imu.c \
+    tiny_imu/tiny_imu.c tiny_linalg/tiny_linalg.c -lm && ./test_imu
+
+=== x86 PC 端测试 (先本地验证) ===
+
+  编译:
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_window tiny_window/test_window.c tiny_window/tiny_window.c \
+      tiny_imu/tiny_imu.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_window     # 预期: 6 passed, 0 failed
+
+=== RISC-V 交叉编译 ===
+
+  1. 安装工具链:
+     浏览器打开 https://musl.cc/
+     下载 riscv64-linux-musl-cross.tgz
+     tar xzf riscv64-linux-musl-cross.tgz -C /opt
+     export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+
+  2. 编译测试程序:
+     riscv64-linux-musl-gcc -std=c99 -O2 -static \
+       -o test_window tiny_window/test_window.c tiny_window/tiny_window.c \
+       tiny_imu/tiny_imu.c tiny_opt/tiny_opt.c \
+       tiny_linalg/tiny_linalg.c -lm
+
+  3. 编译静态库 (供 nav_main 链接):
+     riscv64-linux-musl-gcc -std=c99 -O2 -c \
+       tiny_window/tiny_window.c -o tiny_window_riscv.o
+     riscv64-linux-musl-ar rcs libtiny_window_riscv.a tiny_window_riscv.o
+
+  编译选项说明:
+    -std=c99       使用 C99 标准
+    -O2            优化级别
+    -static        静态链接 (避免 musl 版本不匹配)
+    -lm            链接数学库 (cos/sin/sqrt/log/tan)
+
+=== 部署到设备 ===
+
+  adb push test_window /root/
+  adb shell chmod +x /root/test_window
+  adb shell /root/test_window
+  # 期望输出: "6 passed, 0 failed"
+
+=== 集成到导航应用 ===
+
+  完整导航应用链接:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      tiny_window/tiny_window.c \
+      tiny_imu/tiny_imu.c tiny_ekf/tiny_ekf.c \
+      tiny_pnp/tiny_pnp.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c \
+      -lm -lpthread
+
+  典型调用流程:
+    1. 初始化: window_init(&w, g, sigma_vis_r, sigma_vis_t)
+    2. IMU 回调 (200Hz): imu_preint_update(&preint, acc, gyr, dt)
+    3. PnP 回调 (30Hz):
+       a. window_add_keyframe(&w, ts, R_pnp, t_pnp, &preint)
+       b. 若窗口满 → window_optimize(&w, 30)
+                     → window_drop_oldest(&w)
+                     → 重新添加 (或直接覆盖)
+       c. window_optimize(&w, 30) 做紧耦合优化
+       d. window_get_pose(&w, R, t, v) 获取最新位姿+速度
+       e. window_get_biases(&w, ba, bg) 获取偏置估计
+       f. imu_preint_reset(&preint, ba, bg) 用新偏置重置预积分
+
+=== MaixCAM-Pro 运行时参数建议 ===
+
+  视觉噪声 (根据实际 PnP 精度调整):
+    sigma_vis_r = 0.01 ~ 0.05 rad   (旋转噪声, 对应 ~0.6° ~ 3°)
+    sigma_vis_t = 0.02 ~ 0.10 m     (平移噪声, 对应 2 ~ 10 cm)
+
+  IMU 噪声 (ICM-20948 典型值):
+    sigma_g  = 0.001 rad/s/√Hz
+    sigma_a  = 0.01  m/s²/√Hz
+
+  LM 优化参数:
+    max_iter = 30    (每次窗口优化的最大迭代次数)
+    eps_grad = 1e-6  (梯度收敛阈值, 略大于默认以加快收敛)
+
+  窗口配置:
+    WINDOW_MAX_KF = 5  (关键帧数量, 可在 tiny_window.h 中修改)
+    关键帧间隔 = 33-100ms (对应相机 10-30 fps)
+
+=== tiny_window 特有注意事项 ===
+
+  1. 栈内存:
+     LM 工作区约 120 KB (J: 61 KB + H/H_aug/L: 55 KB + 其他 ~4 KB),
+     窗口状态约 5 KB (5 个关键帧 × ~1 KB/帧)。
+     总计约 125-130 KB, 在 MaixCAM 8 MB 线程栈下安全。
+     注意: 不要在主线程深层调用中使用 (主线程栈通常 128-256 KB)。
+
+  2. N≥3 约束:
+     window_optimize 要求至少 3 个关键帧 (n_resid ≥ n_state)。
+     2 帧时 n_state=18, n_resid=15, LM 会拒绝执行。
+     启动阶段需要先积累 3 帧再做首次优化。
+
+  3. 失锁恢复:
+     PnP 跟踪丢失时 (特征点不足), 有两个选择:
+     (a) 跳过该帧, 等 PnP 恢复后重新积累 3 帧
+     (b) 在残差函数中跳过该帧的 PnP 因子, 仅用 IMU 传播
+     当前实现不支持 (b), 需要修改 window_residual 中的 PnP 循环。
+
+  4. 偏置线性化点:
+     当前所有 IMU 因子共用一个偏置线性化点 (取窗口第 2 帧的预积分偏置)。
+     这是简化处理。Forster 论文建议每个 IMU 因子保存各自的偏置 Jacobian,
+     在优化迭代中单独修正。
+
+  5. musl 浮点兼容性:
+     - 三角函数 (cos/sin/sqrt/log/tan) musl 实现与 glibc 一致
+     - mat33_exp_so3 / mat33_log_so3 经过 120+ 个测试验证
+     - Cholesky 需要 sqrt, musl 实现正确
+     - 无 M_PI 依赖 (窗口代码中未直接使用 π)
+
+=== 常见问题 ===
+
+  Q: 优化后位置完全没变, 是不是没工作?
+  A: 看速度估计。如果速度从 0 变成了非零值, 说明 IMU 因子在工作。
+     位置不变是因为 v_0 自由, 优化器调整速度来同时满足 IMU 和 PnP。
+     运行多轮滑动窗口后, v_0 继承历史估计值, 位置会逐步偏离 PnP
+     向真值靠近。
+
+  Q: 窗口满后怎样处理?
+  A: window_add_keyframe 返回 -1 → window_optimize → window_drop_oldest
+     → 重新 add。先优化再丢弃, 确保丢弃的信息已充分用于约束剩余帧。
+
+  Q: 多少个关键帧效果最好?
+  A: N=5 是经验值。N 太小时约束不足 (N<3 甚至无法求解),
+     N 太大时 (N>10) LM 求解变慢, 且最老帧的信息衰减严重。
+     在 30-100ms 关键帧间隔下, N=5 覆盖 0.15-0.5 秒时间窗口。
+
+  Q: 需要每个关键帧都优化吗?
+  A: 可以。每帧优化一次, 30 次迭代在 MaixCAM 上预计 5-10ms。
+     如果 PnP 频率过高 (60fps+), 可以每 2-3 帧优化一次,
+     中间帧跳过优化, 仅添加到窗口。
+
+  Q: 如何验证优化质量?
+  A: 检查 w.final_cost 和 w.n_iter。
+     final_cost 应在 1e-6 以下 (高质量), 1e-3 以下 (可接受)。
+     n_iter 应在 10-20 之间。若 n_iter=30 表示未收敛,
+     增大 max_iter 或调大 eps_cost。

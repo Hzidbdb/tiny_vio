@@ -1,0 +1,74 @@
+tiny_pnp MaixCAM-Pro (RISC-V) 移植指南
+=========================================
+
+=== 概述 ===
+
+tiny_pnp 是 EPnP 位姿解算器, 依赖 tiny_linalg 和 tiny_opt。
+输入: n 个 2D-3D 对应点 + 相机内参 → 输出: R,t。
+
+算法流程:
+  EPnP 线性解 → β 距离约束 → 3D-3D Horn 绝对定向 → LM 重投影精化
+
+=== 已验证的测试结果 (2026-07-25) ===
+                    | glibc (gcc)      | musl (x86)       | musl (RISC-V)
+  tinylinalg        | 65 passed, 0 fail| 65 passed, 0 fail| 待实机验证
+  tiny_opt          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_ekf          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_pnp          | 20 passed, 0 fail| 20 passed, 0 fail| 待实机验证
+
+=== x86 PC 端测试 ===
+
+  gcc -std=c99 -Wall -Wextra -O2 \
+    -o test_pnp tiny_pnp/test_pnp.c tiny_pnp/tiny_pnp.c \
+    tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+  ./test_pnp     # 预期: 20 passed, 0 failed
+
+=== RISC-V 交叉编译 ===
+
+  riscv64-linux-musl-gcc -std=c99 -O2 -static \
+    -o test_pnp tiny_pnp/test_pnp.c tiny_pnp/tiny_pnp.c \
+    tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+
+=== 典型使用场景 ===
+
+  1. 智能车视觉定位 (地标已知 3D 坐标):
+     - n=4..8 个 AprilTag / 二维码地标, 3D 坐标预标定
+     - 相机 30fps 检测 + PnP 解算 → 6-DOF 位姿
+     - 位姿送入 EKF 融合 IMU/里程计
+
+  2. PnP + EKF 融合:
+     ekf_predict(&ekf, imu_transition, NULL, 0.005, Q);
+     pnp_solve(landmarks_3D, keypoints_2D, n, &cam, &res);
+     // 将 res.R, res.t 转为观测, 喂入 EKF:
+     ekf_update(&ekf, pose_observation, pose_meas, R_pose, 6);
+
+=== 精度与速度 ===
+
+  - 无噪声: 重投影 RMS < 1e-6 像素 (EPnP+LM 精化至机器精度)
+  - σ=1px 噪声: RMS ≈ 1.0 像素, 平移误差 < 0.01m (3.5m 距离)
+  - LM 精化: 5-10 次迭代, 每次 ~7 次残差求值 (数值 Jacobian)
+
+=== 常见问题 ===
+
+  Q: 控制点退化怎么检测和预防
+  A: 代码已自动修复 PCA 退化 (叉积生成独立方向)。
+     如果 3D 点完全共面 (所有 z 相同), 第三个特征值为 0,
+     控制点 c4 将用 10% 主方差缩放 → 仍然可用但精度略降。
+     建议: 使用至少 1 个非共面点。
+
+  Q: Horn 绝对定向 vs 直接解 R,t
+  A: Horn 方法通过 SVD 找到最优旋转, 保证 det(R)=+1。
+     如果 mat33_svd 返回 det(R)=-1 (反射), 代码取反 V 最后一列修正。
+
+  Q: 为什么噪声测试 t_error 只有 0.007?
+  A: EPnP+LM 精化在 σ=1px 噪声下精度非常高。
+     实际场景中, 点检测噪声、标定误差、畸变等因素会增大误差。
+     使用 8+ 个点可进一步提高鲁棒性。
+
+  Q: 最大支持多少点
+  A: PNP_MAX_POINTS=20 (位于 tiny_pnp.h)。增大宏即支持更多点,
+     栈内存增加 ~20*2*12=480 doubles/额外点。
+
+  Q: 支持畸变矫正吗
+  A: 不支持。在调用 pnp_solve 前对 2D 点做畸变矫正 (用 OpenCV 或
+     MaixPy 的 calibration 模块)。矫正后的点传入即可。

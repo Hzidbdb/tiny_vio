@@ -1,0 +1,117 @@
+tiny_imu 测试指南
+================
+
+=== 文件说明 ===
+  tiny_imu.h         头文件 (imu_preint_t 结构体、5 个 API 声明)
+  tiny_imu.c         实现文件 (~260 行, Forster 预积分 + 误差状态协方差传播)
+  test_imu.c         测试文件 (55 个断言, 覆盖 8 个测试场景)
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译 (从项目根目录执行):
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_imu tiny_imu/test_imu.c tiny_imu/tiny_imu.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_imu
+
+  预期输出:
+    init / reset ...
+    zero motion ...
+    constant velocity (pure translation) ...
+    pure rotation (Z axis) ...
+    constant acceleration (parabolic) ...
+    bias correction ...
+    covariance growth ...
+    edge cases ...
+
+    55 passed, 0 failed
+
+  返回值 0 = 全部通过, 非 0 = 有失败
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  安装工具链:
+    # 下载 musl RISC-V 工具链 https://musl.cc/
+    wget https://musl.cc/riscv64-linux-musl-cross.tgz
+    tar xzf riscv64-linux-musl-cross.tgz -C /opt
+    export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+
+  编译:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o test_imu tiny_imu/test_imu.c tiny_imu/tiny_imu.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  推送到设备:
+    adb push test_imu /root/
+    adb shell chmod +x /root/test_imu
+    adb shell /root/test_imu
+
+=== 编译成静态库 ===
+
+  # x86
+  gcc -std=c99 -O2 -c tiny_imu/tiny_imu.c -o tiny_imu.o
+  gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg.o
+  ar rcs libtiny_imu.a tiny_imu.o tiny_linalg.o
+
+  # RISC-V
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_imu/tiny_imu.c -o tiny_imu_riscv.o
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_imu_riscv.a tiny_imu_riscv.o tiny_linalg_riscv.o
+
+=== 测试覆盖清单 ===
+
+  功能测试 (6):
+    test_init_reset          初始化清零、更新后重置、偏置更新正确
+    test_zero_motion         静止 IMU (a=0, ω=0)→ ΔR=I, Δv=0, Δp=0, 协方差增长
+    test_constant_velocity   纯平移 (a=[2,0,0], ω=0)→ Δv=a·T=0.2, Δp=0.5·a·T²=0.01
+    test_pure_rotation       纯旋转 ω_z=1.0 rad/s ×1.0s → R 精确匹配 cos(1)/sin(1)
+    test_constant_accel      抛物线轨迹 a=[3,0,0] ×0.2s → Δv=0.6, Δp=0.06
+    test_bias_correction     带偏置积分 → 一阶修正后接近零偏置参考值
+
+  鲁棒性测试 (2):
+    test_covariance_growth   噪声=0.1/0.05, 50 次采样后 trace 显著增长
+    test_edge_cases          dt=0 被忽略, 负 dt 被忽略
+
+  验证项:
+    - 旋转矩阵正交性: dR 非对角元 < 1e-14 (纯平移时)
+    - 预积分离散化精度: Δv, Δp 与解析解误差 < 1e-10
+    - 协方差正定性: 对角元 > 0 (δθ, δv, δp 各方向)
+    - 偏置修正精度: 修正后 dR 误差 < 1e-6, Δv/Δp 误差 < 1e-4
+    - 多采样稳定性: 60 次采样不崩溃不 NaN
+
+=== API 快速参考 ===
+
+  // 初始化 (在每段关键帧开始时调用)
+  imu_preint_t preint;
+  double ba[3] = {0, 0, 0}, bg[3] = {0, 0, 0};
+  imu_preint_init(&preint, 0.01, 0.001, 1e-4, 1e-5, ba, bg);
+
+  // 每次 IMU 采样 (200Hz 典型)
+  imu_preint_update(&preint, acc, gyr, dt);
+
+  // 关键帧到达时: 提取预积分量
+  double dR[9], dv[3], dp[3];
+  imu_preint_get_delta(&preint, dR, dv, dp);
+
+  // EKF 更新偏置后: 一阶修正预积分量
+  imu_preint_bias_correct(&preint, ba_new, bg_new);
+
+  // 下一段关键帧: 重置
+  imu_preint_reset(&preint, ba_new, bg_new);
+
+=== 与 tiny_ekf 的配合 ===
+
+  IMU 预积分的输出直接喂给 EKF 做预测步:
+
+  1. 在关键帧之间累积预积分: imu_preint_update()
+  2. 关键帧到达时提取 ΔR/Δv/Δp
+  3. 用预积分量构造 EKF 状态转移 (用户回调中实现):
+     R_wb_new = R_wb_old * ΔR
+     v_w_new  = v_w_old + R_wb_old * Δv + g * dt_total
+     p_w_new  = p_w_old + v_w_old*dt_total + R_wb_old * Δp + 0.5*g*dt_total²
+  4. 同时用预积分协方差 Σ 构造 EKF 过程噪声 Q
+  5. EKF 观测更新: 视觉 PnP 解算的位姿 (通过 tiny_pnp)
+  6. 偏置修正: imu_preint_bias_correct()
+  7. 重置预积分器: imu_preint_reset()

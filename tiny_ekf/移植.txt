@@ -1,0 +1,190 @@
+tiny_ekf MaixCAM-Pro (RISC-V) 移植指南
+=======================================
+
+=== 概述 ===
+
+tiny_ekf 是纯 C99 实现的通用扩展卡尔曼滤波器,
+依赖 tiny_linalg (mat_mul, mat_transpose, mat_add, mat_sub,
+mat_cholesky, mat_cholesky_solve, mat_vec_mul, mat_identity)。
+零外部依赖 (仅 libm), 静态链接即可部署到 MaixCAM-Pro。
+
+=== 已验证的测试结果 (2026-07-25) ===
+
+                    | glibc (gcc)      | musl (x86)       | musl (RISC-V)
+  ------------------|------------------|------------------|------------------
+  tiny_linalg       | 65 passed, 0 fail| 65 passed, 0 fail| 待实机验证
+  tiny_opt          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_ekf          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+
+=== 依赖检查 ===
+
+移植前确保 tiny_linalg 已在 x86 上通过测试:
+  musl-gcc -std=c99 -O2 -static -o test_linalg_musl \
+    tiny_linalg/test_linalg.c tiny_linalg/tiny_linalg.c -lm
+  ./test_linalg_musl     # 预期: 65 passed, 0 failed
+
+=== x86 PC 端测试 (先本地验证) ===
+
+  编译:
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_ekf tiny_ekf/test_ekf.c tiny_ekf/tiny_ekf.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_ekf         # 预期: 22 passed, 0 failed
+
+=== RISC-V 交叉编译 ===
+
+  1. 安装工具链 (同 tiny_linalg):
+     浏览器打开 https://musl.cc/
+     下载 riscv64-linux-musl-cross.tgz
+     tar xzf riscv64-linux-musl-cross.tgz -C /opt
+     export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+     riscv64-linux-musl-gcc --version
+
+  2. 编译测试程序:
+     riscv64-linux-musl-gcc -std=c99 -O2 -static \
+       -o test_ekf tiny_ekf/test_ekf.c tiny_ekf/tiny_ekf.c \
+       tiny_linalg/tiny_linalg.c -lm
+
+  3. 编译静态库 (供 nav_main 链接):
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_ekf/tiny_ekf.c -o tiny_ekf_riscv.o
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+     riscv64-linux-musl-ar rcs libtiny_ekf_riscv.a tiny_ekf_riscv.o tiny_linalg_riscv.o
+
+  编译选项说明:
+    -std=c99       使用 C99 标准
+    -O2            优化级别 (速度和体积平衡)
+    -static        静态链接 (推荐, 避免 musl 版本不匹配)
+    -lm            链接数学库 (musl 的 libm, 测试用 atan2/cos/sin)
+
+=== 部署到设备 ===
+
+  # 推送测试程序
+  adb push test_ekf /root/
+  adb shell chmod +x /root/test_ekf
+  adb shell /root/test_ekf
+
+  # 期望输出: "22 passed, 0 failed"
+
+=== 集成到导航应用 ===
+
+  在 nav_main 中链接 tiny_ekf 和 tiny_linalg:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      tiny_ekf/tiny_ekf.c tiny_linalg/tiny_linalg.c \
+      -lm -lpthread
+
+  或使用预编译的静态库:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      -L. -ltiny_ekf_riscv -ltiny_linalg_riscv \
+      -lm -lpthread
+
+=== 典型 EKF 配置 (智能车导航) ===
+
+  状态向量 (5 维): [x, y, θ, v, ω]
+    x, y:  世界坐标 (m)
+    θ:     航向角 (rad)
+    v:     线速度 (m/s)
+    ω:     角速度 (rad/s)
+
+  控制输入 (2 维): u = [v_cmd, ω_cmd]  (来自底盘里程计/命令)
+
+  状态转移 (CTRV 模型 — 恒转速率和速度):
+    x_pred[0] = x + v/ω * (sin(θ+ω*dt) - sin(θ))   (ω != 0 时)
+    x_pred[1] = y + v/ω * (cos(θ) - cos(θ+ω*dt))
+    x_pred[2] = θ + ω*dt
+    x_pred[3] = v  (可选: 加控制输入融合)
+    x_pred[4] = ω
+
+  观测:
+    - 里程计:    直接观测 [v, ω], m=2
+    - 视觉 PnP:  观测 [x, y, θ] (或使用 tiny_pnp + tiny_opt 替代), m=3
+    - IMU 角速度: 直接观测 ω, m=1
+
+  噪声设置建议 (调参起点):
+    - 过程噪声 Q:
+      diag([0.01, 0.01, 0.001, 0.1, 0.01])   (位置>角度>速度)
+    - 观测噪声 R:
+      里程计: diag([0.04, 0.001])             (线速度噪声大, 角速度精确)
+      视觉:   diag([0.01, 0.01, 0.0004])       (x,y 0.1m, θ 0.02rad)
+      IMU:    [0.0001]                         (角速度噪声很小)
+
+=== tiny_ekf 特有注意事项 ===
+
+  1. 栈分配上限:
+     EKF_MAX_STATE=12, EKF_MAX_OBS=12
+     工作区 ~24 KB 栈 (在 8MB 默认线程栈下完全安全)。
+
+     如果状态维度 > 12 (如加入 IMU 偏置 + 地标), 需要修改头文件:
+       #define EKF_MAX_STATE  24
+       #define EKF_MAX_OBS    24
+     内存将增长到 ~90 KB (n² 项主导), 仍在安全范围内。
+
+  2. ekf_predict 中 x 原地更新:
+     f() 回调的第一个输出 x_pred 直接指向 ekf->x,
+     回调内部直接写入 ekf->x, 无需再 memcpy。
+     这要求回调先读 x 再写 x_pred — 实现时注意顺序。
+
+  3. S 求逆失败时静默丢弃观测:
+     当 S=H*P*H^T+R 非正定且 4 级扰动均失败时,
+     ekf_update 返回 m 但不修改 x 或 P。
+     这在 P 发散 (例如过程噪声 Q 过小) 时可能频繁发生。
+     调用方应监控 P 的迹 (trace), 如果持续增长应该复位或增大 Q。
+
+  4. 与 tiny_opt 混合使用:
+     当观测模型高度非线性 (如 PnP 位姿解算) 时,
+     EKF 的线性化可能不够精确。可选用 LM 优化替代线性更新:
+
+       // 用 EKF 预测值作为 LM 初值
+       double x_opt[6] = {ekf.x[0], ekf.x[1], ekf.x[2], ...};
+       lm_solve(x_opt, ...);
+       // x_opt 现在是最优状态, 写回 EKF
+
+     但协方差更新仍是线性的 — 这是 EKF 的固有近似。
+
+  5. musl 浮点兼容性:
+     - 回调中可能用到三角函数 (sin/cos/atan2), musl 实现正确
+     - 不需要 M_PI (用户回调中自行处理)
+     - NaN 检测: S 非正定通过 Cholesky 返回值判断, 不直接检测 NaN
+
+=== PC 端 musl 兼容性验证 ===
+
+  sudo apt install musl-tools
+  musl-gcc -std=c99 -O2 -static \
+    -o test_ekf_musl tiny_ekf/test_ekf.c tiny_ekf/tiny_ekf.c \
+    tiny_linalg/tiny_linalg.c -lm
+  ./test_ekf_musl       # 应输出: 22 passed, 0 failed
+
+=== 常见问题 ===
+
+  Q: ekf_update 返回了 m 但状态没变化
+  A: S 求逆失败 (4 级扰动都非正定), 观测被静默丢弃。
+     检查: (a) P 是否发散 (trace 持续增长)
+           (b) R 是否过小 (观测噪声矩阵太乐观)
+           (c) 状态数量是否正确匹配
+
+  Q: 协方差 P 不再对称
+  A: Joseph 形式理论保证对称, 如果出现不对称:
+     检查状态转移 Jacobian F 是否正确 (F 错误会导致预测步破坏对称性)
+     检查是否有多线程并发访问 ekf (EKF 不是线程安全的)
+
+  Q: 估计结果震荡/发散
+  A: 常见原因:
+     a) Q 太小 → 增大过程噪声 (让滤波器更信任观测)
+     b) R 太大 → 减小观测噪声 (让滤波器更信任观测)
+     c) dt 太大 → 减小预测周期 (200Hz 对 EKF 通常足够)
+     d) Jacobian 错误 → 对比数值 Jacobian 验证解析形式
+
+  Q: 如何验证 Jacobian 正确性
+  A: 在 PC 端用前向差分交叉验证:
+     对第 j 列: (f(x + h*e_j) - f(x)) / h 应与 F 的第 j 列一致
+     h = 1e-8 * max(|x_j|, 1.0)
+     相对误差应在 1e-6 以内
+
+  Q: 最大支持多少观测
+  A: EKF_MAX_OBS=12。对于视觉特征点 (每个点 2 维观测),
+     最多 6 个特征点。如需更多, 增大宏定义即可。

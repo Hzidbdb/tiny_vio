@@ -1,0 +1,160 @@
+tiny_opt MaixCAM-Pro (RISC-V) 移植指南
+=========================================
+
+=== 概述 ===
+
+tiny_opt 是纯 C99 实现的 Levenberg-Marquardt 非线性优化求解器,
+依赖 tiny_linalg (mat_cholesky, mat_cholesky_solve, mat_copy, vec_add, vec_dot)。
+两个库都是零外部依赖 (仅 libm), 一起静态链接即可部署到 MaixCAM-Pro。
+
+=== 已验证的测试结果 (2026-07-25) ===
+
+                    | glibc (gcc)      | musl (x86)       | musl (RISC-V)
+  ------------------|------------------|------------------|------------------
+  tiny_linalg       | 65 passed, 0 fail| 65 passed, 0 fail| 待实机验证
+  tiny_opt          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+
+  musl 本地验证命令:
+    sudo apt install musl-tools
+    musl-gcc -std=c99 -O2 -static -o test_linalg_musl \
+      tiny_linalg/test_linalg.c tiny_linalg/tiny_linalg.c -lm
+    ./test_linalg_musl     # 65 passed, 0 failed
+
+    musl-gcc -std=c99 -O2 -static -o test_opt_musl \
+      tiny_opt/test_opt.c tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+    ./test_opt_musl        # 22 passed, 0 failed
+
+=== 依赖检查 ===
+
+移植前确保 tiny_linalg 已在 x86 上通过测试:
+  gcc -std=c99 -Wall -Wextra -O2 -o test_linalg \
+    tiny_linalg/test_linalg.c tiny_linalg/tiny_linalg.c -lm
+  ./test_linalg     # 预期: 65 passed, 0 failed
+
+=== x86 PC 端测试 (先本地验证) ===
+
+  编译:
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_opt tiny_opt/test_opt.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_opt       # 预期: 22 passed, 0 failed
+
+=== RISC-V 交叉编译 ===
+
+  1. 安装工具链 (同 tiny_linalg):
+     浏览器打开 https://musl.cc/
+     下载 riscv64-linux-musl-cross.tgz
+     tar xzf riscv64-linux-musl-cross.tgz -C /opt
+     export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+     riscv64-linux-musl-gcc --version
+
+  2. 编译测试程序:
+     riscv64-linux-musl-gcc -std=c99 -O2 -static \
+       -o test_opt tiny_opt/test_opt.c tiny_opt/tiny_opt.c \
+       tiny_linalg/tiny_linalg.c -lm
+
+  3. 编译静态库 (供 tiny_pnp / tiny_ekf 链接):
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_opt/tiny_opt.c -o tiny_opt_riscv.o
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+     riscv64-linux-musl-ar rcs libtiny_opt_riscv.a tiny_opt_riscv.o tiny_linalg_riscv.o
+
+  编译选项说明:
+    -std=c99       使用 C99 标准
+    -O2            优化级别 (速度和体积平衡)
+    -static        静态链接 (推荐, 避免 musl 版本不匹配)
+    -lm            链接数学库 (musl 的 libm, 提供 sqrt/fabs/fmax/exp/pow)
+
+=== 部署到设备 ===
+
+  # 推送测试程序
+  adb push test_opt /root/
+  adb shell chmod +x /root/test_opt
+  adb shell /root/test_opt
+
+  # 期望输出: "22 passed, 0 failed"
+
+=== 集成到导航应用 ===
+
+  在 nav_main 中链接 tiny_opt 和 tiny_linalg:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c \
+      -lm -lpthread
+
+  或使用预编译的静态库:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      -L. -ltiny_opt_riscv -ltiny_linalg_riscv \
+      -lm -lpthread
+
+=== tiny_opt 特有注意事项 ===
+
+  1. 栈分配上限:
+     LM_MAX_PARAMS=12, LM_MAX_RESIDUALS=40
+     工作区 ~9.5 KB 栈 (在 8MB 默认线程栈下完全安全)。
+
+     如果问题规模更大, 需要修改头文件中的宏:
+     #define LM_MAX_PARAMS    24    // 最多 24 个参数
+     #define LM_MAX_RESIDUALS  80    // 最多 80 个残差
+     内存将增长到 ~40 KB, 仍然安全。
+
+     同时检查 tiny_linalg.h 中 mat_cholesky_solve 的内部
+     y[16] 缓冲区 — 如果 n > 16, 需要增大该数组。
+
+  2. musl 浮点兼容性:
+     - tiny_opt 不使用 M_PI, 不涉及 acos/sin/cos, 无 musl 头文件差异
+     - 数值 Jacobian 步长硬编码 √ε = 1.49e-8 (不依赖 DBL_EPSILON 宏)
+     - NaN 检测用 `x != x` 而非 isnan() 宏 (musl 可能需要额外 define)
+     - 收敛阈值 1e-8: RISC-V 硬件双精度与 x86 一致, 不需要放宽
+
+  3. mat_cholesky_solve 内部缓冲区限制:
+     tiny_linalg.c 中 mat_cholesky_solve 有 `double y[16]` 的内部
+     前代/回代工作区。当前 LM_MAX_PARAMS=12 < 16, 安全。
+     若增大参数上限超过 16, 需要同步修改该数组大小。
+
+  4. 数值 Jacobian 开销:
+     - 每次需要 n+1 次残差调用 (1 次基准 + n 次扰动)
+     - n=6 (PnP): 7 次, n=12 (最大): 13 次
+     - 对于重投影优化 (每点 1 次投影), 这完全可接受
+
+=== PC 端 musl 兼容性验证 ===
+
+  在 Ubuntu 上安装 x86 musl 工具链提前验证:
+
+    sudo apt install musl-tools
+    musl-gcc -std=c99 -O2 -static \
+      -o test_opt_musl tiny_opt/test_opt.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+    ./test_opt_musl     # 应输出: 22 passed, 0 failed
+
+  这是最接近目标设备行为的本地测试方式。
+
+=== 常见问题 ===
+
+  Q: 编译报 "undefined reference to sqrt" 等
+  A: 检查是否加了 -lm。RISC-V musl-gcc 也需要显式链接数学库。
+
+  Q: lm_solve 返回 -2 (λ 爆炸)
+  A: 可能原因:
+     a) 残差函数返回 NaN — 检查残差计算中的 sqrt/除法/exp
+     b) 初值离最优解太远 — 尝试更好的初值, 或用 config.lambda_init 设更大值
+     c) 问题本身就是病态的 (m << n, 或参数有冗余) — 考虑正则化
+
+  Q: lm_solve 返回 -1 (达到最大迭代)
+  A: 增加 config.max_iter (默认 100), 或放宽收敛阈值。
+     对于 PnP 重投影优化, 通常 10-20 次就收敛, 100 次完全够用。
+
+  Q: 解析 Jacobian 和数值 Jacobian 结果不同
+  A: 数值 Jacobian 需要更多迭代 (13 vs 13 在 Rosenbrock 上相同)。
+     如果差异很大, 检查解析 Jacobian 导数是否正确。
+     可以用数值 Jacobian 交叉验证解析 Jacobian 的每一列。
+
+  Q: 与 Ceres / g2o / GTSAM 的结果不同
+  A: tiny_opt 使用标准的阻尼 LM 算法。差异可能来自:
+     a) 线搜索 (Ceres 默认有, tiny_opt 没有) — 对凸问题影响小
+     b) 收敛阈值不同 — tiny_opt 默认 1e-8
+     c) λ 更新策略 — tiny_opt 用 Nielsen, Ceres 用 Marquardt
+     对于 PnP/重投影优化, 差异在 1e-6 级别, 可忽略。

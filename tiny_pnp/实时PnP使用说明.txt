@@ -1,0 +1,219 @@
+实时摄像头 PnP 位姿测算使用说明
+================================
+
+=== 文件清单 ===
+
+  live_pnp.py             实时 PnP 程序 (Python, ctypes 调 C 库)
+  live_pnp.cpp            实时 PnP 程序 (C++, OpenCV C++ API 直调 C 库)
+  live_pnp                编译好的 C++ 二进制 (x86-64)
+  libtinypnp.so           编译好的 C PnP 共享库
+  tiny_pnp.h / tiny_pnp.c EPnP 位姿解算源码
+  checkerboard_7x10.png   可打印棋盘格 (7×10 内角点)
+
+=== 启动方式 ===
+
+  --- C++ 版 (推荐, 无 GC 抖动) ---
+
+    cd tiny_pnp
+    ./live_pnp
+
+  --- Python 版 ---
+
+  方式 1: 本地桌面 (有显示器)
+    cd tiny_pnp
+    python3 live_pnp.py
+
+  方式 2: SSH 远程 (HTTP 流, 浏览器观看)
+    cd tiny_pnp
+    python3 live_pnp.py --http 8765
+    浏览器打开 http://<本机IP>:8765/
+
+=== 编译命令 ===
+
+  --- C++ 版 (从项目根目录) ---
+
+    # 先编译 C 共享库
+    gcc -std=c99 -O2 -fPIC -shared -o tiny_pnp/libtinypnp.so \
+      tiny_pnp/tiny_pnp.c tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+
+    # 再编译 C++ 程序
+    g++ -std=c++17 -O2 -o tiny_pnp/live_pnp tiny_pnp/live_pnp.cpp \
+      -I tiny_pnp $(pkg-config --cflags --libs opencv4) \
+      -L tiny_pnp -ltinypnp -Wl,-rpath,'$ORIGIN'
+
+  --- Python 版 ---
+
+    无需编译, 只需:
+      pip3 install opencv-python numpy
+
+=== 参数说明 ===
+
+  --cam 0         摄像头设备ID (默认 0)
+  --rows 7        棋盘格内角点行数 (默认 7, 需 ≤11)
+  --cols 10       棋盘格内角点列数 (默认 10, 需 ≤11)
+  --square 25     方格边长, 单位毫米 (默认 25mm)
+  --fx 450        相机焦距 fx, 像素 (默认 450)
+  --fy 450        相机焦距 fy, 像素 (默认 450)
+  --cx 320        主点 cx, 像素 (默认 320)
+  --cy 240        主点 cy, 像素 (默认 240)
+
+  C++ 版示例:
+    ./live_pnp --rows 6 --cols 8 --square 30
+    ./live_pnp --fx 500 --fy 500 --cam 1
+
+  Python 版示例:
+    python3 live_pnp.py --rows 6 --cols 8 --square 30
+    python3 live_pnp.py --http 8080 --cam 1
+
+  * 注意: 点数上限 PNP_MAX_POINTS=80 (如 7×10=70, 8×10=80)
+    LM 残差上限 LM_MAX_RESIDUALS=160 (点数×2)
+
+=== 准备工作 ===
+
+  1. 打印棋盘格:
+     打开 checkerboard_7x10.png, 缩放使方格边长 = 25mm
+     贴到硬纸板上 (确保平整)
+
+  2. 调整摄像头:
+     棋盘格对着摄像头, 保持完整可见
+     摄像头分辨率默认 640×480
+     良好光照, 避免反光
+
+  3. 相机内参 (可选标定):
+     若不准确, 用 OpenCV 标定:
+       cap = cv2.VideoCapture(0)
+       # 拍 15-20 张不同角度的棋盘格照片
+       cv2.calibrateCamera(objpoints, imgpoints, (640,480), ...)
+
+=== 画面说明 ===
+
+  找到棋盘格时:
+    - 彩色角点标记 (棋盘格检测结果)
+    - 红绿蓝坐标系 (红=X, 绿=Y, 蓝=Z, 相机坐标系)
+      X 向右, Y 向下, Z 向前 (光轴方向)
+    - 黄色矩形框 (棋盘格外轮廓在 3D 中的投影)
+    - 底部绿色文字:
+        Pos: X=xxx.x Y=xxx.x Z=xxx.x mm   当前位置
+        Dist=xxxmm  Pitch=±xx.x°  Yaw=±xx.x°  距离, 俯仰, 偏航
+        Reproj=x.xxxpx  LM=x                 重投影误差, LM 迭代次数
+    - 红色 PnP FAILED(ret=-1): PnP 解算失败 (点数超限/退化)
+
+  未找到棋盘格时:
+    - 仅有原始画面 + FPS 计数
+
+=== 按键 ===
+
+  q      退出
+  s      保存当前帧为 PNG 截图 (文件名含时间戳)
+
+=== 精度说明 ===
+
+  测试结果 (test_realistic.c, 12个非共面点):
+    无噪声:       重投影 < 1e-6 px, 位姿误差 < 1μm
+    σ=0.3px 噪声: 重投影 0.33px, 位姿误差 2.7mm
+    σ=1.0px 噪声: 重投影 1.11px, 位姿误差 9.1mm
+    5 个点:        重投影 0.37px, 位姿误差 15.9mm
+
+  影响精度的因素:
+    - 角点检测质量 (光照、模糊、倾斜)
+    - 相机内参标定精度 (fx/fy/cx/cy)
+    - 棋盘格方格尺寸测量精度 (--square 参数)
+    - 纯平面目标: Z 方向有深度歧义, 误差可能大
+
+  建议:
+    - 多拍几张标定内参 (不要用默认值)
+    - 用硬质棋盘格 (不要皱)
+    - 确保棋盘格在画面中占比 > 30%
+    - 非共面地标 (不同高度) 可消除深度歧义
+
+=== 性能 ===
+
+  C++ 版: PnP 求解 ~0.15ms + OpenCV 角点检测 ~5-10ms → 总帧率 ~25-35 FPS
+  Python 版: 同上 + ctypes 转换 + GC 抖动 → 总帧率 ~20-30 FPS
+
+=== 架构 ===
+
+  live_pnp.cpp (C++, OpenCV)
+    ├── 摄像头采集   cv::VideoCapture
+    ├── 棋盘格检测   cv::findChessboardCorners + cornerSubPix
+    ├── PnP 解算     pnp_solve() → libtinypnp.so (纯C)
+    │     ├── EPnP 线性解 + β 优化
+    │     ├── Horn 绝对定向 (3D-3D)
+    │     └── LM 重投影精化 (6 维 se(3))
+    └── 绘制显示     cv::imshow + 坐标轴/文字
+
+=== 故障排除 ===
+
+  Q: 打不开摄像头
+  A: 检查 --cam 参数 (0/1/2...)
+     ls /dev/video*
+     或用 v4l2-ctl --list-devices 查看
+
+  Q: libtinypnp.so 找不到
+  A: C++ 版: 确保 live_pnp 和 libtinypnp.so 在同一目录
+     Python 版: 确保 live_pnp.py 和 libtinypnp.so 在同一目录
+
+  Q: PnP FAILED ret=-1 (棋盘格检测到了但没位姿)
+  A: 通常是容量不够, 检查:
+     - 角点数 > PNP_MAX_POINTS (80)? 检查 tiny_pnp.h 调整
+     - 角点数×2 > LM_MAX_RESIDUALS (160)? 检查 tiny_opt.h 调整
+     若改宏后重新编译 .so 和 live_pnp
+
+  Q: 棋盘格检测不到
+  A: 确保棋盘格完整在画面内
+     检查 --rows 和 --cols 参数是否匹配实际棋盘格
+     内角点数 = 方格数 - 1 (如 8×11 方格 → 7×10 内角点)
+     尝试更好的光照
+
+  Q: 位姿跳动
+  A: 角点检测噪声导致, 可以:
+     - 增大棋盘格尺寸 (更多角点 → 更稳定)
+     - 提高角点检测精度 (改善光照)
+     - 在 C 侧用 EKF 对连续帧做时序平滑 (下一步任务)
+
+  Q: 位姿明显错误
+  A: 检查:
+     - --square 是否与实际方格尺寸一致
+     - 相机内参是否正确 (默认值可能不准)
+     - 是否有镜头畸变 (本程序不支持畸变矫正)
+     - 是否只有纯平面点 (加不同高度的标记)
+     - 棋盘格方向: OpenCV 检测的角点从左上开始
+
+  Q: SSH 远程看不到画面
+  A: 用 Python HTTP 流模式:
+     python3 live_pnp.py --http 8080
+     浏览器打开 http://<服务器IP>:8080/
+     防火墙需开放对应端口
+
+=== 从 C 代码直接调用 ===
+
+  #include "tiny_pnp.h"
+
+  pnp_camera_t cam = {450, 450, 320, 240};
+  pnp_result_t  res;
+  double pts3D[n*3] = {...};  // 世界坐标 (mm)
+  double pts2D[n*2] = {...};  // 像素坐标 (px)
+
+  int ret = pnp_solve(pts3D, pts2D, n, &cam, &res);
+  // res.R[9] = 旋转矩阵 (行优先)
+  // res.t[3] = 平移向量 (mm)
+  // P_camera = R * P_world + t
+  // 距离 = sqrt(t[0]²+t[1]²+t[2]²)
+
+  编译:
+    gcc -std=c99 -O2 -o my_app my_app.c \
+      tiny_pnp.c tiny_opt.c tiny_linalg.c -lm
+
+  容量限制:
+    PNP_MAX_POINTS=80  (tiny_pnp.h)
+    LM_MAX_RESIDUALS=160 (tiny_opt.h)
+    LM_MAX_PARAMS=12, EKF_MAX_STATE=12, EKF_MAX_OBS=12
+
+=== 交叉编译到 MaixCAM-Pro ===
+
+  riscv64-linux-musl-gcc -std=c99 -O2 -static \
+    -o test_pnp tiny_pnp/test_pnp.c tiny_pnp/tiny_pnp.c \
+    tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+
+  adb push test_pnp /root/
+  adb shell /root/test_pnp

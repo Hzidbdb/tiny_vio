@@ -1,0 +1,230 @@
+tiny_imu MaixCAM-Pro (RISC-V) 移植指南
+========================================
+
+=== 概述 ===
+
+tiny_imu 是纯 C99 实现的 IMU 预积分模块 (Forster et al., TRO 2017),
+依赖 tiny_linalg (mat_mul, mat33_exp_so3, mat_vec_mul, mat_copy,
+mat_identity, mat_transpose)。零外部依赖 (仅 libm),
+静态链接即可部署到 MaixCAM-Pro。
+
+=== 已验证的测试结果 (2026-07-26) ===
+
+                    | glibc (gcc)      | musl (x86)       | musl (RISC-V)
+  ------------------|------------------|------------------|------------------
+  tiny_linalg       | 65 passed, 0 fail| 65 passed, 0 fail| 待实机验证
+  tiny_opt          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_ekf          | 22 passed, 0 fail| 22 passed, 0 fail| 待实机验证
+  tiny_pnp          | 20 passed, 0 fail| 20 passed, 0 fail| 待实机验证
+  tiny_imu          | 55 passed, 0 fail| 待 musl 验证     | 待实机验证
+
+=== 依赖检查 ===
+
+移植前确保 tiny_linalg 已在 x86 上通过测试:
+  musl-gcc -std=c99 -O2 -static -o test_linalg_musl \
+    tiny_linalg/test_linalg.c tiny_linalg/tiny_linalg.c -lm
+  ./test_linalg_musl     # 预期: 65 passed, 0 failed
+
+=== x86 PC 端测试 (先本地验证) ===
+
+  编译:
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_imu tiny_imu/test_imu.c tiny_imu/tiny_imu.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_imu         # 预期: 55 passed, 0 failed
+
+=== RISC-V 交叉编译 ===
+
+  1. 安装工具链 (同 tiny_linalg):
+     浏览器打开 https://musl.cc/
+     下载 riscv64-linux-musl-cross.tgz
+     tar xzf riscv64-linux-musl-cross.tgz -C /opt
+     export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+     riscv64-linux-musl-gcc --version
+
+  2. 编译测试程序:
+     riscv64-linux-musl-gcc -std=c99 -O2 -static \
+       -o test_imu tiny_imu/test_imu.c tiny_imu/tiny_imu.c \
+       tiny_linalg/tiny_linalg.c -lm
+
+  3. 编译静态库 (供 nav_main 链接):
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_imu/tiny_imu.c -o tiny_imu_riscv.o
+     riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+     riscv64-linux-musl-ar rcs libtiny_imu_riscv.a tiny_imu_riscv.o tiny_linalg_riscv.o
+
+  编译选项说明:
+    -std=c99       使用 C99 标准
+    -O2            优化级别 (速度和体积平衡)
+    -static        静态链接 (推荐, 避免 musl 版本不匹配)
+    -lm            链接数学库 (so3_right_jacobian 中用到 cos/sin/sqrt)
+
+=== 部署到设备 ===
+
+  # 推送测试程序
+  adb push test_imu /root/
+  adb shell chmod +x /root/test_imu
+  adb shell /root/test_imu
+
+  # 期望输出: "55 passed, 0 failed"
+
+=== 集成到导航应用 ===
+
+  在 nav_main 中链接 tiny_imu 和 tiny_linalg:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      tiny_imu/tiny_imu.c tiny_ekf/tiny_ekf.c \
+      tiny_pnp/tiny_pnp.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c \
+      -lm -lpthread
+
+  或使用预编译的静态库:
+
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o nav_main nav_main.c \
+      -L. -ltiny_imu_riscv -ltiny_ekf_riscv \
+      -ltiny_pnp_riscv -ltiny_opt_riscv -ltiny_linalg_riscv \
+      -lm -lpthread
+
+=== 典型 IMU 参数 (智能车竞赛) ===
+
+  ICM-20948 (常见 9 轴 IMU) 典型噪声参数:
+
+    参数           | 值              | 说明
+    ---------------|-----------------|---------------------------
+    sigma_g        | 0.001 rad/s/√Hz | 陀螺仪噪声密度
+    sigma_a        | 0.01  m/s²/√Hz  | 加速度计噪声密度
+    sigma_bg       | 1e-5 rad/s²/√Hz | 陀螺仪偏置随机游走
+    sigma_ba       | 1e-4 m/s³/√Hz   | 加速度计偏置随机游走
+
+  IMU 频率: 200Hz (MaixCAM-Pro 通过 MaixPy imu 模块读取)
+  关键帧频率: 30fps (相机帧率)
+  每帧间 IMU 采样数: ~6-7 次
+
+=== 预积分 → EKF 状态预测 (用户回调示例) ===
+
+  假设 EKF 状态 x = [p(3), v(3), θ(3), b_a(3), b_g(3)] (15维):
+
+    void imu_transition(const double *x, const double *u, double dt,
+                        double *x_pred, double *F, int n)
+    {
+        // x 格式: [px,py,pz, vx,vy,vz, θx,θy,θz, bax,bay,baz, bgx,bgy,bgz]
+        const double *p  = x;
+        const double *v  = x + 3;
+        const double *th = x + 6;  // so(3) 旋转向量
+        const double *ba = x + 9;
+        const double *bg = x + 12;
+
+        // 从预积分读取 ΔR, Δv, Δp
+        // (由调用方在调用 ekf_predict 前更新 preint 并传入)
+        double dR[9], dv[3], dp[3];
+
+        // 当前姿态矩阵: R_wb = Exp(θ)
+        double R_wb[9];
+        mat33_exp_so3(th, R_wb);
+
+        // 姿态预测: R_new = R_old * ΔR
+        double R_new[9];
+        mat_mul(R_wb, dR, R_new, 3, 3, 3);
+
+        // 提取新旋转向量
+        double th_new[3];
+        mat33_log_so3(R_new, th_new);
+
+        // 速度预测: v_new = v_old + R_wb*Δv + g*dt
+        double dv_w[3];
+        mat_vec_mul(R_wb, dv, dv_w, 3, 3);
+        double g[3] = {0, 0, -9.81};  // 重力 (世界系 -Z)
+        for (int i = 0; i < 3; i++)
+            x_pred[3+i] = v[i] + dv_w[i] + g[i]*dt;
+
+        // 位置预测: p_new = p_old + v_old*dt + R_wb*Δp + 0.5*g*dt²
+        double dp_w[3];
+        mat_vec_mul(R_wb, dp, dp_w, 3, 3);
+        for (int i = 0; i < 3; i++)
+            x_pred[i] = p[i] + v[i]*dt + dp_w[i] + 0.5*g[i]*dt*dt;
+
+        // 姿态和偏置不变 (偏置由随机游走驱动)
+        for (int i = 0; i < 3; i++) {
+            x_pred[6+i] = th_new[i];
+            x_pred[9+i] = ba[i];
+            x_pred[12+i] = bg[i];
+        }
+
+        // F = Jacobian df/dx (15×15), 此处省略...
+        // 关键: 偏置块对 ΔR/Δv/Δp 的 Jacobian 用 imu_preint_t 中的
+        // J_dR_bg, J_dv_ba 等填充, 参考 Forster 论文公式(70)-(71)
+    }
+
+=== tiny_imu 特有注意事项 ===
+
+  1. 栈内存:
+     imu_preint_t 约 1.2 KB (cov 81 doubles + Jacobian 45 doubles
+     + 其他 29 doubles = 155 doubles = 1240 bytes)。
+     imu_preint_update 工作区约 2.5 KB (A/B/BQBt 等临时矩阵)。
+     EKF + PnP + IMU 三个模块同时活跃时总栈 ≈ 15-20 KB,
+     在 8 MB 默认线程栈下完全安全。
+
+  2. 预积分时间窗口:
+     两关键帧间隔通常 ≤ 100ms (10fps 最低帧率)。
+     窗口过长 → 偏置线性化误差增大, 协方差过度累积。
+     建议在 33-100ms 之间 (10-30 fps 相机)。
+
+  3. 重力处理:
+     预积分在机体 (IMU) 坐标系下计算, 不含重力。
+     重力在 EKF 状态预测步中由用户回调施加 (见上例)。
+     加速度计读数应包含重力分量, 由 preint_update 中减去偏置后
+     直接积分, 不做重力补偿。
+
+  4. 偏置初始化:
+     静止 1-2 秒, 平均加速度计读数作为重力方向的初始姿态,
+     平均陀螺仪读数作为 bg 初值。ba 通常初始化为零。
+     静止检测: IMU 方差 < 阈值 (如 acc 方差 < 0.01, gyr 方差 < 0.001)。
+
+  5. musl 浮点兼容性:
+     - so3_right_jacobian 中用 cos/sin/sqrt, musl 实现正确
+     - 不需要 M_PI (内部未使用 π)
+     - 协方差矩阵无 Cholesky (预积分协方差传播是 A·Σ·A^T + Q,
+       不需要求逆), 因此不存在 tiny_ekf 中的 S 非正定问题
+
+=== PC 端 musl 兼容性验证 ===
+
+  sudo apt install musl-tools
+  musl-gcc -std=c99 -O2 -static \
+    -o test_imu_musl tiny_imu/test_imu.c tiny_imu/tiny_imu.c \
+    tiny_linalg/tiny_linalg.c -lm
+  ./test_imu_musl       # 应输出: 55 passed, 0 failed
+
+=== 常见问题 ===
+
+  Q: 协方差矩阵变为负定
+  A: 当前传播公式 Σ←A·Σ·A^T + B·Q·B^T 理论上保持正定。
+     如果变负定, 检查:
+     (a) A 矩阵的 A00 块是否为正交 (Exp(-ω·dt) 应严格正交)
+     (b) Q_meas 对角色是否 > 0 (噪声参数不能为 0)
+     (c) dt 是否过大 (> 0.1s) 导致 Euler 近似失效
+
+  Q: 偏置修正后结果反而更差
+  A: 一阶修正仅在偏置变化小时有效。
+     ||δbg|| > 0.01 rad/s 或 ||δba|| > 0.1 m/s² 时应重新积分。
+     或者多次小步修正替代一次大步修正。
+
+  Q: 预积分量与真实运动不匹配
+  A: 常见原因:
+     a) IMU 偏置估计不准确 → 检查初始化阶段静止估计
+     b) IMU 与相机时间戳未对齐 → 检查硬件同步
+     c) dt 计算错误 → 用高精度定时器 (clock_gettime)
+     d) 加速度计比例因子未校准 → 做 6 面标定
+
+  Q: 如何验证预积分精度
+  A: 用仿真数据对比:
+     生成一段已知的 IMU 轨迹 (解析 R(t), v(t), p(t))。
+     解析计算 ΔR/Δv/Δp 真值, 与预积分结果对比。
+     在 dt=0.005s (200Hz) 时, 误差应 < 1e-8。
+
+  Q: 可以同时预积分多段吗
+  A: 可以。分配多个 imu_preint_t 结构体, 每段独立调用
+     imu_preint_update。典型场景: 滑动窗口优化中维护多个
+     关键帧间的预积分约束。

@@ -1,0 +1,139 @@
+tiny_window 测试指南
+====================
+
+=== 文件说明 ===
+  tiny_window.h      头文件 (window_kf_t/window_t 结构体、7 个 API 声明)
+  tiny_window.c      实现文件 (~400 行, 滑动窗口紧耦合 LM 优化)
+  test_window.c      测试文件 (6 个断言, 覆盖 2 个测试场景)
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译 (从项目根目录执行):
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_window tiny_window/test_window.c tiny_window/tiny_window.c \
+      tiny_imu/tiny_imu.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_window
+
+  预期输出:
+    Test: minimal window (3 kf, straight line) ...
+      LM ret=0  iter=~19  converged=3  cost=0.000000
+    Test: sliding window (5 kf, circular traj, 5s) ...
+      windows optimized: 22
+      avg pos error: 优化后 < 优化前
+      avg yaw error: 优化后 < 优化前
+
+    6 passed, 0 failed
+
+  返回值 0 = 全部通过, 非 0 = 有失败
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  编译测试程序:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o test_window tiny_window/test_window.c tiny_window/tiny_window.c \
+      tiny_imu/tiny_imu.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  推送到设备:
+    adb push test_window /root/
+    adb shell chmod +x /root/test_window
+    adb shell /root/test_window
+
+=== 编译成静态库 ===
+
+  # RISC-V
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_window/tiny_window.c -o tiny_window_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_window_riscv.a tiny_window_riscv.o \
+    libtiny_imu_riscv.a libtiny_opt_riscv.a libtiny_linalg_riscv.a
+
+=== 测试覆盖清单 ===
+
+  功能测试 (2):
+    test_minimal_window     3 关键帧直线加速运动, 验证 LM 收敛、代价下降、
+                            IMU 信息被使用 (速度估计非零)。
+                            注意: v_0 自由时位置不偏离 PnP 是正确行为,
+                            优化器通过调整速度使 PnP 和 IMU 同时满足。
+    test_sliding_window     25 关键帧圆周运动 (R=5m, ω=1 rad/s),
+                            5 帧滑动窗口, 200Hz IMU + 5Hz PnP 噪声。
+                            验证优化后位置/偏航误差小于原始 PnP。
+
+  验证项:
+    - LM 收敛: ret=0, converged>0, final_cost≈0
+    - 滑动窗口: 位置误差降 ~8%, 偏航误差降 ~19%
+    - 栈安全: 窗口状态 45 维, 残差 60 维, 总栈约 130 KB
+
+=== API 快速参考 ===
+
+  // 初始化 (设置重力和视觉噪声参数)
+  window_t w;
+  double g[3] = {0, 0, -9.81};
+  window_init(&w, g, 0.01, 0.05);   // σ_R=0.01rad, σ_t=0.05m
+
+  // 每次 PnP 给出位姿时: 取出累积的 IMU 预积分, 添加关键帧
+  int ret = window_add_keyframe(&w, ts, R_pnp, t_pnp, &preint);
+  if (ret != 0) {
+      // 窗口满: 先优化, 丢弃最老帧, 再添加
+      window_optimize(&w, 30);
+      window_drop_oldest(&w);
+      window_add_keyframe(&w, ts, R_pnp, t_pnp, &preint);
+  }
+
+  // 每帧都优化一次 (或按需)
+  window_optimize(&w, 30);
+
+  // 读取最新关键帧的优化后位姿和速度
+  double R[9], t[3], v[3];
+  window_get_pose(&w, R, t, v);
+
+  // 读取当前偏置估计
+  double ba[3], bg[3];
+  window_get_biases(&w, ba, bg);
+
+=== 状态参数化 ===
+
+  状态向量 (N 个关键帧):
+    [v_0(3), ξ_1(6), v_1(3), ..., ξ_{N-1}(6), v_{N-1}(3), ba(3), bg(3)]
+
+  其中 ξ_i ∈ se(3) = [rx,ry,rz, tx,ty,tz], v_i ∈ R³.
+  首个关键帧位姿固定 (消除规范自由度), 速度参与估计.
+  维度: 3 + (N-1)×9 + 6 = 9N
+
+  | N | 参数维度 | 残差维度 |
+  |---|---------|---------|
+  | 2 | 18      | 15 (欠定, LM 拒绝) |
+  | 3 | 27      | 30 |
+  | 4 | 36      | 45 |
+  | 5 | 45      | 60 |
+
+=== 残差类型 ===
+
+  IMU 预积分因子 (关键帧 i→i+1, 9 维):
+    r_R = log(ΔR_corr^T · R_i^T · R_{i+1})
+    r_v = R_i^T · (v_{i+1} - v_i - g·dt) - Δv_corr
+    r_p = R_i^T · (t_{i+1} - t_i - v_i·dt - ½g·dt²) - Δp_corr
+  协方差加权: 用预积分协方差的对角线元素做白化.
+
+  PnP 视觉因子 (关键帧 i, 6 维):
+    r_vis_R = log(R_i^T · R_pnp_i)
+    r_vis_t = t_i - t_pnp_i
+  权重: w_R = 1/σ_vis_R, w_t = 1/σ_vis_t
+
+=== 与其它模块的配合 ===
+
+  IMU 回调 (200Hz):
+    imu_preint_update(&preint, acc, gyr, dt);
+
+  PnP 回调 (30Hz):
+    1. 取出当前预积分量
+    2. window_add_keyframe(&w, ts, R_pnp, t_pnp, &preint)
+    3. 若窗口满 → window_optimize() → window_drop_oldest() → 重新添加
+    4. window_optimize() 做紧耦合优化
+    5. imu_preint_reset(&preint, ba, bg) 用优化后的偏置重置
+
+  优化后状态流程:
+    最新关键帧位姿 → 视觉/导航模块使用
+    偏置估计 → 重置 IMU 预积分器
+    速度估计 → 用于下一帧 PnP 的先验

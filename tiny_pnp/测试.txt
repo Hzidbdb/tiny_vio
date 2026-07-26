@@ -1,0 +1,62 @@
+tiny_pnp 测试指南
+===============
+
+=== 文件说明 ===
+  tiny_pnp.h         头文件 (相机内参、结果结构体、pnp_solve 声明)
+  tiny_pnp.c         实现文件 (~420 行, EPnP + Horn 绝对定向 + LM 精化)
+  test_pnp.c         测试文件 (20 个断言, 覆盖 4 个测试场景)
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译 (从项目根目录执行):
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_pnp tiny_pnp/test_pnp.c tiny_pnp/tiny_pnp.c \
+      tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_pnp
+
+  预期输出:
+    frontal pose (4 coplanar points) ...
+      t=[0.0000, 0.0000, 5.0000] reproj=2.88e-10
+    arbitrary pose (12 random points) ...
+      max_reproj=1.14e-13, t_error=[...], lm_iter=9
+    noisy data (Gaussian noise σ=1px) ...
+      reproj_RMS=1.0682, t_error=0.0071, lm_iter=7
+    edge cases ...
+
+    20 passed, 0 failed
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  安装工具链后编译:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o test_pnp tiny_pnp/test_pnp.c tiny_pnp/tiny_pnp.c \
+      tiny_opt/tiny_opt.c tiny_linalg/tiny_linalg.c -lm
+
+  推送:
+    adb push test_pnp /root/
+    adb shell /root/test_pnp
+
+=== 编译成静态库 ===
+
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_pnp/tiny_pnp.c -o tiny_pnp_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_pnp_riscv.a tiny_pnp_riscv.o \
+    tiny_opt_riscv.o tiny_linalg_riscv.o
+
+=== 测试覆盖清单 ===
+
+    test_frontal_pose      正面相机 (4 共面点, R≈I, t≈[0,0,5])
+    test_arbitrary_pose    任意位姿 (12 随机点, 验证 R,t 恢复 + 重投影 < 1e-4)
+    test_noisy_data        加噪声 σ=1px (8 点, 验证 LM 精化有效 + 误差可控)
+    test_edge_cases        边界检查 (n<4, NULL cam, NULL result)
+
+=== API 快速参考 ===
+
+  pnp_camera_t cam = {800, 600, 320, 240};  // fx, fy, cx, cy
+  pnp_result_t res;
+  int ret = pnp_solve(points_3D, points_2D, n, &cam, &res);
+  // res.R[9]: 旋转矩阵 (行优先), res.t[3]: 平移向量
+  // P_cam = R * P_world + t
+  // res.reproj_err: 最终 RMS 重投影误差 (像素)
+  // n: 4 ≤ n ≤ 20 (PNP_MAX_POINTS)

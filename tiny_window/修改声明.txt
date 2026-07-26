@@ -1,0 +1,201 @@
+tiny_window 修改声明
+====================
+日期: 2026-07-27
+作者: garygoo + Claude Code
+
+本模块为新增的滑动窗口紧耦合视觉-惯性优化器。
+以下列出为实现本模块而对已有代码所做的所有修改。
+
+----------------------------------------------------------------------
+修改 1: tiny_opt/tiny_opt.h — 增大问题规模上限
+----------------------------------------------------------------------
+
+  文件: tiny_opt/tiny_opt.h:12
+  变更: #define LM_MAX_PARAMS 48   (原 12)
+        #define LM_MAX_RESIDUALS 160 (未变, 已为 160)
+
+  原因: 滑动窗口优化需要 27-45 个参数 (3-5 关键帧),
+        原上限 12 不够用。残差上限 160 已够用 (最多 60 维)。
+
+  影响: LM 栈工作区从 ~10 KB 增加到 ~120 KB。
+        所有已有测试 (22 个) 重新运行通过。
+
+----------------------------------------------------------------------
+修改 2: tiny_linalg/tiny_linalg.c — 修复 Cholesky 求解缓冲区溢出
+----------------------------------------------------------------------
+
+  文件: tiny_linalg/tiny_linalg.c:450
+  变更: double y[16] → double y[64]
+
+  原因: mat_cholesky_solve 的临时数组 y[] 写死为 16, 在 n>16 时
+        越界写入破坏栈数据, 导致段错误。窗口优化需要 n=27-45,
+        触发此 bug。增加至 64 覆盖 LM_MAX_PARAMS=48 的需求。
+
+  影响: 这是一个潜伏 bug, 之前所有调用都在 n≤12 范围内 (EKF 12 维、
+        PnP 控制点 12 维、LM 原上限 12 维), 所以未暴露。
+        所有已有测试 (65+22+22+20+55=184 个断言) 重新运行通过。
+
+----------------------------------------------------------------------
+修改 3: 新增 tiny_window/ — 滑动窗口紧耦合优化器
+----------------------------------------------------------------------
+
+  新增文件:
+    tiny_window/tiny_window.h    头文件 (7 个 API, 2 个结构体, 2 个宏)
+    tiny_window/tiny_window.c    实现文件 (~400 行)
+    tiny_window/test_window.c    测试文件 (~310 行, 6 个断言)
+    tiny_window/测试.txt         测试指南 (本文件)
+    tiny_window/错误报告.txt     错误记录与设计决策
+    tiny_window/移植.txt         RISC-V 移植指南
+    tiny_window/修改声明.txt     修改记录 (本文件)
+
+  核心功能:
+    - 滑动窗口: 维持 N=5 个关键帧, 循环缓冲, O(1) 增删
+    - 状态参数化: se(3) Lie 代数位姿 (6 维) + 世界系速度 (3 维) + IMU 偏置 (6 维)
+    - 规范固定: 首个关键帧位姿固定, 速度自由
+    - 残差类型:
+      a) IMU 预积分因子: 9 维 (旋转/速度/位置), 协方差对角加权
+      b) PnP 视觉因子: 6 维 (旋转/平移), 噪声参数加权
+    - 偏置修正: 一阶 Taylor 展开 (J_dR_bg, J_dv_ba 等)
+    - 数值 Jacobian: 依赖 tiny_opt 的前向差分数值微分
+
+  依赖:
+    tiny_linalg  (mat_mul, mat_vec_mul, mat33_exp/log_so3, mat_copy, mat_transpose, vec_dot)
+    tiny_opt     (lm_solve, 数值 Jacobian)
+    tiny_imu     (imu_preint_t 结构体, imu_preint_init/update)
+
+  未修改的模块:
+    tiny_imu/   — 无修改
+    tiny_ekf/   — 无修改
+    tiny_pnp/   — 无修改
+
+----------------------------------------------------------------------
+修改 4: tiny_window/tiny_window.c — 解析 Jacobian 替换数值 Jacobian
+----------------------------------------------------------------------
+
+  日期: 2026-07-27 (同日, 第 2 轮修改)
+
+  变更: 将 window_optimize 中的 lm_solve 调用从数值 Jacobian (传 NULL)
+        改为解析 Jacobian (传 window_jacobian)。
+
+  新增函数:
+    skew3()              — 3×3 反对称矩阵
+    fill_J_block()       — 将 3×3 块填入 Jacobian 矩阵
+    apply_row_weights()  — 对 3×3 块逐行乘白化权重
+    window_jacobian()    — 解析 Jacobian 计算 (~180 行)
+
+  状态偏移辅助函数:
+    off_v(), off_xi(), off_ba(), off_bg()
+
+  修复的 bug:
+    a) so3_right_jacobian() 符号错误: skew 项 +C → −C
+       (标准公式 Jr = A·I + B·aa^T − C·skew(a))
+    b) ∂r_R/∂φ_i 变量引用错误: tmp → block
+    c) ∂r_R/∂φ_i 矩阵错误: R_{i+1}^T·R_i → dR_corr^T
+
+  删除:
+    - mat33_inv() 函数 (未使用)
+    - 数值 Jacobian debug 对比代码
+    - 未使用的 ba_cur 变量
+
+  测试: 6/6 通过 (无变化, 数值 Jacobian 版也是 6/6)
+
+----------------------------------------------------------------------
+修改 5: tiny_window/tiny_window.c — ctx 固化偏置偏移
+----------------------------------------------------------------------
+
+  日期: 2026-07-27 (同日, 第 3 轮修改)
+
+  变更: resid_ctx_t 新增 ba_off / bg_off 字段, window_optimize 中快照,
+        window_residual / window_jacobian 改为使用 ctx->ba_off / ctx->bg_off,
+        不再调用 off_ba(n_kf) / off_bg(n_kf) 动态计算。
+
+  原因: 消除 ctx->n_kf 与 w->n_kf 不同步时偏置偏移计算错误的风险。
+
+  测试: 6/6 通过
+
+----------------------------------------------------------------------
+修改 6: tiny_window/ — 添加 Huber 核函数 + 边际化接口预留
+----------------------------------------------------------------------
+
+  日期: 2026-07-27 (同日, 第 4 轮修改)
+
+  变更:
+    a) resid_ctx_t 新增 huber_wt[WINDOW_MAX_RESID] 数组,
+       window_residual 末尾计算 IRLS 权重并存入,
+       window_jacobian 末尾逐行应用到 J
+    b) 新增 API: window_set_huber_delta() 启用/关闭 Huber 核
+    c) 新增 API: window_marginalize_oldest() 预留接口 (返�� -1)
+    d) window_t 新增字段: huber_delta (Huber 阈值),
+       has_prior/H_prior/b_prior/x_prior (边际化先验)
+    e) window_init 初始化 huber_delta=0, has_prior=0
+
+  原因: 用户要求 "Huber 核可不可以做" + "预留边��化接口"。
+        Huber 核降低异常 PnP 观测的权重, 提升鲁棒性。
+        边际化接口为后续 Schur 补实现预留数据结构。
+
+  测试: 6/6 通过 (Huber 默认关闭, 不影响已有测试)
+
+----------------------------------------------------------------------
+修改 7: tiny_linalg/ — 新增 mat33_right_jacobian + _inv
+----------------------------------------------------------------------
+
+  日期: 2026-07-27 (同日, 第 5 轮修改)
+
+  变更:
+    a) tiny_linalg.h: 新增 mat33_right_jacobian() 和
+       mat33_right_jacobian_inv() 声明
+    b) tiny_linalg.c: 新增两个函数实现 (~50 行),
+       公式 Jr = (sinθ/θ)I + (1-sinθ/θ)aa^T - ((1-cosθ)/θ)skew(a)
+
+  原因: SO(3) 右 Jacobian 在 tiny_imu 和 tiny_window 中各有一份独立实现,
+        不是 bug 但违反 DRY 原则。提取到 tiny_linalg 统一维护。
+
+  影响:
+    - tiny_imu/tiny_imu.c: 删除本地 so3_right_jacobian(), 改为调用
+      mat33_right_jacobian() (skew_mat 保留, 协方差传播仍需它)
+    - tiny_window/tiny_window.c: 删除本地 so3_right_jacobian() 和
+      so3_right_jacobian_inv(), 改为调用 linalg 版本
+      (skew3 保留, IMU Jacobian 仍需它)
+
+  测试: 全部模块重新测试通过 (linalg 65/65, imu 55/55, window 7/7)
+
+----------------------------------------------------------------------
+修改 8: tiny_window/ — 添加 v0 速度先验
+----------------------------------------------------------------------
+
+  日期: 2026-07-27 (同日, 第 6 轮修改)
+
+  变更:
+    a) window_t 新增 sigma_v0_prior 字段
+    b) 新增 API: window_set_v0_prior(w, sigma), sigma>0 启用
+    c) window_optimize: v0 先验启用时 n_resid += 3
+    d) window_residual: r_v0 = v_0 / sigma  (3 维)
+    e) window_jacobian: ∂r_v0/∂v_0 = I/sigma
+    f) WINDOW_MAX_RESID: 60 → 66 (为 v0 先验预留 6 个残差位)
+    g) test_minimal_window: 启用 window_set_v0_prior(&w, 0.01),
+       新增 CHECK: v0 优化后接近 0
+
+  原因: 智能车从静止启动, v_0 实际为 0。此前 v_0 完全自由, 优化器可能
+        将 v_0 调到非零值来吸收 PnP 噪声。加入高斯先验 v_0 ~ N(0, σ²)
+        后, v_0 被约束在 0 附近, 提高静止启动场景的估计精度。
+
+  测试: 7/7 通过 (新增 1 个 v0 先验断言)
+
+----------------------------------------------------------------------
+总变更摘要 (最终)
+----------------------------------------------------------------------
+
+  修改文件数: 3 个已有文件 (tiny_opt.h, tiny_linalg.c, tiny_linalg.h)
+  二次修改:   tiny_window/tiny_window.c (解析 Jacobian 替换)
+  三次修改:   tiny_window/tiny_window.c (ctx 固化偏置偏移)
+  四次修改:   tiny_window/tiny_window.c + tiny_window.h (Huber + 边际化)
+  五次修改:   tiny_linalg/ + tiny_imu/ + tiny_window/ (Jr 提取)
+  六次修改:   tiny_window/ (v0 速度先验)
+  新增文件数: 7 个 (tiny_window/ 全部)
+  删除文件数: 0
+  测试回归:  全部已有测试重新通过 (linalg 65/65, opt 22/22,
+             ekf 22/22, pnp 20/20, imu 55/55, window 7/7)
+  总计断言: 191 个全通过
+
+  tiny_linalg.c 最终规模: 21→23 个函数 (新增 2 个 SO(3) Jr 函数)
+  tiny_window.c 最终规模: ~620 行 (含解析 Jacobian ~180 行, Huber ~30 行)

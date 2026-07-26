@@ -1,0 +1,102 @@
+tiny_linalg 测试指南
+===================
+
+=== 文件说明 ===
+  tiny_linalg.h      头文件 (21 个函数声明)
+  tiny_linalg.c      实现文件 (~510 行)
+  test_linalg.c      测试文件 (65 个断言, 覆盖全部 21 个函数)
+  错误报告.txt        已修复的 4 个 bug 记录
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译:
+    gcc -std=c99 -Wall -Wextra -O2 -o test_linalg test_linalg.c tiny_linalg.c -lm
+
+  运行:
+    ./test_linalg
+
+  预期输出:
+    vec_dot ...
+    vec_add / vec_remove ...
+    vec_cross ...
+    vec_L2 ...
+    mat_vec_mul ...
+    mat_mul ...
+    mat_transpose ...
+    mat_add / mat_sub ...
+    mat_vec_madd ...
+    mat_rank1_update ...
+    mat_solve ...
+    mat_cholesky ...
+    mat33_symeig ...
+    mat33_svd ...
+    mat33_exp_so3 ...
+    mat33_log_so3 ...
+    mat_power_inv ...
+    utility ...
+
+    65 passed, 0 failed
+
+  返回值 0 = 全部通过, 非 0 = 有失败
+
+  Windows MinGW 注意:
+    MinGW 的 math.h 默认不暴露 M_PI, test_linalg.c 已自带 #ifndef M_PI 保护
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  安装工具链:
+    # 下载 musl RISC-V 工具链 (选择 riscv64-linux-musl)
+    # https://musl.cc/
+
+  编译:
+    riscv64-linux-musl-gcc -std=c99 -Wall -O2 \
+      -o test_linalg_riscv test_linalg.c tiny_linalg.c -lm
+
+  推送到设备:
+    adb push test_linalg_riscv /root/
+    adb shell chmod +x /root/test_linalg_riscv
+    adb shell /root/test_linalg_riscv
+
+=== 编译成静态库 (供 tiny_opt / tiny_ekf 等模块链接) ===
+
+  # x86
+  gcc -std=c99 -O2 -c tiny_linalg.c -o tiny_linalg.o
+  ar rcs libtiny_linalg.a tiny_linalg.o
+
+  # RISC-V
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg.c -o tiny_linalg_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_linalg_riscv.a tiny_linalg_riscv.o
+
+=== 测试覆盖清单 ===
+
+  向量运算 (5):
+    vec_dot        点积 (含多路展开 + 尾部)
+    vec_add        向量加法
+    vec_remove     向量减法
+    vec_cross      3维叉积
+    vec_L2         L2范数
+
+  矩阵运算 (7):
+    mat_vec_mul    矩阵×向量
+    mat_mul        矩阵×矩阵
+    mat_transpose  转置
+    mat_add        矩阵加法
+    mat_sub        矩阵减法
+    mat_vec_madd   融合乘加 A*x+y
+    mat_rank1_update  rank-1更新 A+=alpha*x*x^T
+
+  线性方程组 (2):
+    mat_solve      高斯消元 (列主元)
+    mat_cholesky + mat_cholesky_solve  Cholesky分解+求解
+
+  特征分解 & SVD (5):
+    mat33_symeig   3x3 对称矩阵特征分解
+    mat_power_inv  逆幂迭代
+    mat33_svd      3x3 SVD (闭式解)
+    mat33_exp_so3  SO(3) 指数映射 (罗德里格斯)
+    mat33_log_so3  SO(3) 对数映射
+
+  工具函数 (3):
+    mat_copy       矩阵拷贝
+    mat_identity   单位矩阵
+    mat_get_diag / mat_set_diag  对角元读写

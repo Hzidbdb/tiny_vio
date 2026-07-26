@@ -1,0 +1,96 @@
+tiny_opt 测试指南
+================
+
+=== 文件说明 ===
+  tiny_opt.h         头文件 (回调类型、配置/结果结构体、lm_solve 声明)
+  tiny_opt.c         实现文件 (~260 行, lm_solve + 数值 Jacobian)
+  test_opt.c         测试文件 (22 个断言, 覆盖 6 个测试场景)
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译 (从项目根目录执行):
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_opt tiny_opt/test_opt.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_opt
+
+  预期输出:
+    linear least squares (analytic J) ...
+    Rosenbrock (analytic J) ...
+      iterations=13, lambda_final=1.01e-03
+    Rosenbrock (numerical J) ...
+      iterations=13, lambda_final=1.01e-03
+    exponential fit (analytic J) ...
+      iterations=6, lambda_final=5.67e-05
+    NULL config / result ...
+    bounds check ...
+
+    22 passed, 0 failed
+
+  返回值 0 = 全部通过, 非 0 = 有失败
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  安装工具链:
+    # 下载 musl RISC-V 工具链 https://musl.cc/
+    wget https://musl.cc/riscv64-linux-musl-cross.tgz
+    tar xzf riscv64-linux-musl-cross.tgz -C /opt
+    export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+
+  编译:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o test_opt tiny_opt/test_opt.c tiny_opt/tiny_opt.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  推送到设备:
+    adb push test_opt /root/
+    adb shell chmod +x /root/test_opt
+    adb shell /root/test_opt
+
+=== 编译成静态库 ===
+
+  # x86
+  gcc -std=c99 -O2 -c tiny_opt/tiny_opt.c -o tiny_opt.o
+  gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg.o
+  ar rcs libtiny_opt.a tiny_opt.o tiny_linalg.o
+
+  # RISC-V
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_opt/tiny_opt.c -o tiny_opt_riscv.o
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_opt_riscv.a tiny_opt_riscv.o tiny_linalg_riscv.o
+
+=== 测试覆盖清单 ===
+
+  功能测试 (4):
+    test_linear_ls         线性最小二乘 y=ax+b (2参数, analytic J, 5次迭代)
+    test_rosenbrock_analytic  Rosenbrock 函数 (2参数, analytic J, 13次迭代)
+    test_rosenbrock_numerical Rosenbrock 函数 (数值微分, 13次迭代)
+    test_exp_fit           指数拟合 y=a*exp(bx)+c (3参数, analytic J, 6次迭代)
+
+  鲁棒性测试 (2):
+    test_null_config       config=NULL / result=NULL 不崩溃
+    test_bounds            m<n / n超限 / NULL residual 正确返回错误码
+
+  验证项:
+    - 收敛到已知最优解 (线性: 闭合解, Rosenbrock: (1,1), 指数: (2,-0.5,1))
+    - 解析 vs 数值 Jacobian 均收敛
+    - 返回值: 0=收敛, -1=达到max_iter, -2=参数错误
+    - 收敛原因: 1=梯度, 2=步长, 3=代价变化
+
+=== API 快速参考 ===
+
+  // 回调: 用户提供残差和 Jacobian
+  void my_residual(const double *params, void *data,
+                    double *r, int m, int n);
+  void my_jacobian(const double *params, void *data,
+                    double *J, int m, int n);  // 可为 NULL
+
+  // 调用求解器
+  lm_result_t res;
+  int ret = lm_solve(x, m, n, my_residual, my_jacobian, data, NULL, &res);
+  // x: 输入初值 + 输出优化结果 (原地修改)
+  // m: 残差维度, n: 参数维度 (m>=n, n<=12, m<=40)
+  // config: NULL=默认 (max_iter=100, tau=1e-3, eps=1e-8)
+  // result: NULL=不需要诊断信息

@@ -1,0 +1,111 @@
+tiny_ekf 测试指南
+================
+
+=== 文件说明 ===
+  tiny_ekf.h         头文件 (回调类型、ekf_t 结构体、3 个 API 声明)
+  tiny_ekf.c         实现文件 (~198 行, Joseph 形式协方差更新 + Cholesky S 求逆)
+  test_ekf.c         测试文件 (22 个断言, 覆盖 5 个测试场景)
+
+=== x86 PC 端测试 (开发验证用) ===
+
+  编译 (从项目根目录执行):
+    gcc -std=c99 -Wall -Wextra -O2 \
+      -o test_ekf tiny_ekf/test_ekf.c tiny_ekf/tiny_ekf.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  运行:
+    ./test_ekf
+
+  预期输出:
+    1D constant velocity (predict only) ...
+    1D position update ...
+      pos=5.0000, vel=1.0000, P_diag=[0.0033, 0.0128]
+    2D robot range+bearing localization ...
+      est=[8.4376, 4.5549, 1.0000] true=[8.4376, 4.5549, 1.0000]
+    Joseph form symmetry ...
+      P = [[0.017876, 0.015661], [0.015661, 0.123716]], det=1.966212e-03
+    edge cases ...
+
+    22 passed, 0 failed
+
+  返回值 0 = 全部通过, 非 0 = 有失败
+
+=== RISC-V 交叉编译 (MaixCAM-Pro 部署) ===
+
+  安装工具链:
+    # 下载 musl RISC-V 工具链 https://musl.cc/
+    wget https://musl.cc/riscv64-linux-musl-cross.tgz
+    tar xzf riscv64-linux-musl-cross.tgz -C /opt
+    export PATH="/opt/riscv64-linux-musl-cross/bin:$PATH"
+
+  编译:
+    riscv64-linux-musl-gcc -std=c99 -O2 -static \
+      -o test_ekf tiny_ekf/test_ekf.c tiny_ekf/tiny_ekf.c \
+      tiny_linalg/tiny_linalg.c -lm
+
+  推送到设备:
+    adb push test_ekf /root/
+    adb shell chmod +x /root/test_ekf
+    adb shell /root/test_ekf
+
+=== 编译成静态库 ===
+
+  # x86
+  gcc -std=c99 -O2 -c tiny_ekf/tiny_ekf.c -o tiny_ekf.o
+  gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg.o
+  ar rcs libtiny_ekf.a tiny_ekf.o tiny_linalg.o
+
+  # RISC-V
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_ekf/tiny_ekf.c -o tiny_ekf_riscv.o
+  riscv64-linux-musl-gcc -std=c99 -O2 -c tiny_linalg/tiny_linalg.c -o tiny_linalg_riscv.o
+  riscv64-linux-musl-ar rcs libtiny_ekf_riscv.a tiny_ekf_riscv.o tiny_linalg_riscv.o
+
+=== 测试覆盖清单 ===
+
+  功能测试 (4):
+    test_predict_only        1D 匀速运动纯预测 (2状态, 10步, 验证状态传播+协方差增长)
+    test_position_update     1D 位置观测 预测+更新 (2状态, 50步, 收敛到真值 pos=5 vel=1)
+    test_robot_localization  2D 机器人 range+bearing 定位 (3状态, 2地标→4观测, 100步收敛)
+    test_joseph_symmetry     Joseph 协方差更新对称性/正定性验证 (20轮预测+更新)
+
+  鲁棒性测试 (1):
+    test_edge_cases          NULL P0 → 默认大对角 (1e6*I), m=0 → 直接返回 0
+
+  验证项:
+    - 状态传播: 纯预测 10 步后 pos=1.0 (正确)
+    - 协方差收敛: 观测更新后 P 对角线缩小
+    - 协方差对称性: |P[i][j] - P[j][i]| < 1e-14
+    - 协方差正定性: 对角元 > 0, 行列式 > 0
+    - 2D 机器人: 100 步后位姿误差 < 0.1m / 0.05rad
+    - 默认 P0: 对角元 1e6, 非对角 0
+
+=== API 快速参考 ===
+
+  // 定义状态转移 (用户提供)
+  void my_transition(const double *x, const double *u, double dt,
+                      double *x_pred, double *F, int n);
+
+  // 定义观测模型 (用户提供)
+  void my_observation(const double *x, double *z_pred, double *H,
+                       int m, int n);
+
+  // 使用示例
+  ekf_t ekf;
+  ekf_init(&ekf, 5, x0, NULL);   // 5 维状态, 默认 P0
+
+  // 预测 (200Hz 典型周期)
+  ekf_predict(&ekf, my_transition, u, 0.005, Q);
+
+  // 更新 (视觉 30fps, 里程计 100Hz)
+  ekf_update(&ekf, my_observation, z, R, m);
+
+  // 状态和协方差在 ekf.x 和 ekf.P 中直接可读
+
+=== 与 tiny_opt 的配合 ===
+
+  当观测模型高度非线性 (如单目 PnP 位姿) 时, EKF 的线性化更新可能发散。
+  此时可用 tiny_opt 的 lm_solve 替代线性化的 ekf_update:
+
+    x_init = ekf.x  (当前预测值作为 LM 初值)
+    lm_solve(x_init, m, n, residual, jacobian, data, NULL, &res)
+    // x_init 现在是优化后的状态, 手动写回 ekf.x
